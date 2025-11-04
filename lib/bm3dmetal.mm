@@ -44,18 +44,6 @@
 
 using namespace std::string_literals;
 
-[[nodiscard]] inline bool handle_metal_error(NSError* err,
-                                             const std::string& message,
-                                             VSFrameContext* context,
-                                             const VSAPI* vsapi) noexcept {
-    if (err != nullptr) {
-        vsapi->setFilterError(
-            (message + [err.localizedDescription UTF8String]).c_str(), context);
-        return true;
-    }
-    return handle_metal_error(err, message, context, vsapi);
-}
-
 static inline void encode_copy_from_vs(id<MTLComputeCommandEncoder> encoder,
                                        id<MTLDevice> device,
                                        const void* src_ptr, size_t src_len,
@@ -145,12 +133,56 @@ struct KernelParams {
 };
 
 struct Metal_Resource {
-    id<MTLBuffer> d_src;
-    id<MTLBuffer> d_res;
-    id<MTLCommandQueue> commandQueue;
-    std::array<id<MTLComputePipelineState>, 8> psos;
-    id<MTLComputePipelineState> copy_pso;
-    id<MTLBuffer> params;
+    id<MTLBuffer> d_src = nil;
+    id<MTLBuffer> d_res = nil;
+    id<MTLCommandQueue> commandQueue = nil;
+    std::array<id<MTLComputePipelineState>, 8> psos = {};
+    id<MTLComputePipelineState> copy_pso = nil;
+    id<MTLBuffer> params = nil;
+
+    ~Metal_Resource() {
+        d_src = nil;
+        d_res = nil;
+        commandQueue = nil;
+        params = nil;
+        psos.fill(nil);
+        copy_pso = nil;
+    }
+
+    Metal_Resource() = default;
+
+    Metal_Resource(Metal_Resource&& other) noexcept
+        : d_src(std::move(other.d_src)), d_res(std::move(other.d_res)),
+          commandQueue(std::move(other.commandQueue)), psos(std::move(other.psos)),
+          copy_pso(std::move(other.copy_pso)), params(std::move(other.params)) {
+        other.d_src = nil;
+        other.d_res = nil;
+        other.commandQueue = nil;
+        other.psos.fill(nil);
+        other.copy_pso = nil;
+        other.params = nil;
+    }
+
+    Metal_Resource& operator=(Metal_Resource&& other) noexcept {
+        if (this != &other) {
+            d_src = std::move(other.d_src);
+            d_res = std::move(other.d_res);
+            commandQueue = std::move(other.commandQueue);
+            psos = std::move(other.psos);
+            copy_pso = std::move(other.copy_pso);
+            params = std::move(other.params);
+            other.d_src = nil;
+            other.d_res = nil;
+            other.commandQueue = nil;
+            other.psos.fill(nil);
+            other.copy_pso = nil;
+            other.params = nil;
+        }
+        return *this;
+    }
+
+    Metal_Resource(const Metal_Resource&) = delete;
+    Metal_Resource& operator=(const Metal_Resource&) = delete;
 };
 
 struct BM3DData {
@@ -173,7 +205,7 @@ struct BM3DData {
     bool zero_init;
 
     size_t d_pitch;
-    id<MTLDevice> device;
+    id<MTLDevice> device = nil;
 
     ticket_semaphore semaphore;
     std::vector<Metal_Resource> resources;
@@ -287,17 +319,42 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
 
         d->semaphore.acquire();
         d->resources_lock.lock();
-        auto resource = d->resources.back();
+        auto resource = std::move(d->resources.back());
         d->resources.pop_back();
         d->resources_lock.unlock();
 
         @autoreleasepool {
+            if (resource.d_src == nil || resource.d_res == nil ||
+                resource.d_src.contents == nullptr ||
+                resource.d_res.contents == nullptr) {
+                d->resources_lock.lock();
+                d->resources.push_back(std::move(resource));
+                d->resources_lock.unlock();
+                d->semaphore.release();
+                vsapi->setFilterError("BM3DMetal: Invalid resource detected. "
+                                      "Buffer allocation may have failed.",
+                                      frameCtx);
+                return nullptr;
+            }
+
             int temporal_width = (2 * d->radius) + 1;
             int num_planes = d->chroma ? 3 : 1;
             int max_height = d->process[0] ? vsapi->getFrameHeight(src, 0)
                                            : vsapi->getFrameHeight(src, 1);
             size_t res_buffer_size = (size_t)num_planes * temporal_width * 2 *
                                      max_height * d->d_pitch;
+
+            if (res_buffer_size > resource.d_res.length) {
+                d->resources_lock.lock();
+                d->resources.push_back(std::move(resource));
+                d->resources_lock.unlock();
+                d->semaphore.release();
+                vsapi->setFilterError("BM3DMetal: Buffer size mismatch. "
+                                      "Required size exceeds allocated buffer.",
+                                      frameCtx);
+                return nullptr;
+            }
+
             memset(resource.d_res.contents, 0, res_buffer_size);
 
             if (d->chroma) {
@@ -379,16 +436,18 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                 auto* h_dst = static_cast<float*>(resource.d_res.contents);
                 for (int plane = 0; plane < 3; ++plane) {
                     if (!d->process.at(plane)) {
-                        h_dst += (size_t)d_stride * height * 2 * temporal_width;
+                        h_dst +=
+                            (size_t)d_stride * height * 2 * temporal_width;
                         continue;
                     }
                     const int s_pitch = vsapi->getStride(src, plane);
 
                     if (radius != 0) {
-                        int out_height = vsapi->getFrameHeight(src, plane) * 2 *
-                                         temporal_width;
+                        int out_height = vsapi->getFrameHeight(src, plane) *
+                                         2 * temporal_width;
                         int width_bytes = static_cast<int>(
-                            vsapi->getFrameWidth(src, plane) * sizeof(float));
+                            vsapi->getFrameWidth(src, plane) *
+                            sizeof(float));
 
                         id<MTLCommandBuffer> outCmdBuf =
                             [resource.commandQueue commandBuffer];
@@ -396,23 +455,25 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                             [outCmdBuf computeCommandEncoder];
                         [outEnc setComputePipelineState:resource.copy_pso];
 
-                        encode_copy_to_vs(outEnc, d->device, resource.d_res,
-                                          reinterpret_cast<uint8_t*>(h_dst) -
-                                              reinterpret_cast<uint8_t*>(
-                                                  resource.d_res.contents),
-                                          d->d_pitch,
-                                          vsapi->getWritePtr(dst.get(), plane),
-                                          (size_t)out_height * s_pitch, s_pitch,
-                                          width_bytes, out_height);
+                        encode_copy_to_vs(
+                            outEnc, d->device, resource.d_res,
+                            reinterpret_cast<uint8_t*>(h_dst) -
+                                reinterpret_cast<uint8_t*>(
+                                    resource.d_res.contents),
+                            d->d_pitch,
+                            vsapi->getWritePtr(dst.get(), plane),
+                            (size_t)out_height * s_pitch, s_pitch,
+                            width_bytes, out_height);
 
                         [outEnc endEncoding];
                         [outCmdBuf commit];
                         [outCmdBuf waitUntilCompleted];
                     } else {
-                        Aggregation(reinterpret_cast<float*>(
-                                        vsapi->getWritePtr(dst.get(), plane)),
-                                    static_cast<int>(s_pitch / sizeof(float)),
-                                    h_dst, d_stride, width, height);
+                        Aggregation(
+                            reinterpret_cast<float*>(
+                                vsapi->getWritePtr(dst.get(), plane)),
+                            static_cast<int>(s_pitch / sizeof(float)),
+                            h_dst, d_stride, width, height);
                     }
                     h_dst += (size_t)d_stride * height * 2 * temporal_width;
                 }
@@ -425,11 +486,26 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                     int width = vsapi->getFrameWidth(src, plane);
                     int height = vsapi->getFrameHeight(src, plane);
                     int s_pitch = vsapi->getStride(src, plane);
-                    int d_stride = static_cast<int>(d->d_pitch / sizeof(float));
-                    int width_bytes = static_cast<int>(width * sizeof(float));
+                    int d_stride =
+                        static_cast<int>(d->d_pitch / sizeof(float));
+                    int width_bytes =
+                        static_cast<int>(width * sizeof(float));
 
                     size_t res_size =
                         (size_t)temporal_width * 2 * height * d->d_pitch;
+
+                    if (res_size > resource.d_res.length) {
+                        d->resources_lock.lock();
+                        d->resources.push_back(std::move(resource));
+                        d->resources_lock.unlock();
+                        d->semaphore.release();
+                        vsapi->setFilterError(
+                            "BM3DMetal: Buffer size mismatch for plane. "
+                            "Required size exceeds allocated buffer.",
+                            frameCtx);
+                        return nullptr;
+                    }
+
                     memset(resource.d_res.contents, 0, res_size);
 
                     id<MTLCommandBuffer> commandBuffer =
@@ -442,22 +518,25 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                     size_t d_src_offset = 0;
                     for (int i = 0; i < num_input_frames; ++i) {
                         const VSFrameRef* frame = srcs[i].get();
-                        encode_copy_from_vs(
-                            encoder, d->device, vsapi->getReadPtr(frame, plane),
-                            (size_t)height * s_pitch, s_pitch, resource.d_src,
-                            d_src_offset, d->d_pitch, width_bytes, height);
+                        encode_copy_from_vs(encoder, d->device,
+                                            vsapi->getReadPtr(frame, plane),
+                                            (size_t)height * s_pitch,
+                                            s_pitch, resource.d_src,
+                                            d_src_offset, d->d_pitch,
+                                            width_bytes, height);
                         d_src_offset += d->d_pitch * height;
                     }
 
                     int pso_idx = (static_cast<int>(d->radius > 0) * 4) +
                                   (0 * 2) + static_cast<int>(d->final_);
-                    [encoder setComputePipelineState:resource.psos.at(pso_idx)];
+                    [encoder
+                        setComputePipelineState:resource.psos.at(pso_idx)];
 
                     [encoder setBuffer:resource.d_res offset:0 atIndex:0];
                     [encoder setBuffer:resource.d_src offset:0 atIndex:1];
 
-                    auto* params =
-                        static_cast<KernelParams*>([resource.params contents]);
+                    auto* params = static_cast<KernelParams*>(
+                        [resource.params contents]);
                     params->width = width;
                     params->height = height;
                     params->stride = d_stride;
@@ -472,9 +551,9 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                     params->extractor = d->extractor;
 
                     [encoder setBuffer:resource.params offset:0 atIndex:2];
-                    [encoder
-                        setThreadgroupMemoryLength:sizeof(float) * 8 * (32 + 1)
-                                           atIndex:0];
+                    [encoder setThreadgroupMemoryLength:sizeof(float) * 8 *
+                                                        (32 + 1)
+                                                atIndex:0];
 
                     MTLSize gridDim = MTLSizeMake(
                         (width + (4 * d->block_step.at(plane) - 1)) /
@@ -489,15 +568,17 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                     [commandBuffer commit];
                     [commandBuffer waitUntilCompleted];
 
-                    auto* h_dst = static_cast<float*>(resource.d_res.contents);
+                    auto* h_dst =
+                        static_cast<float*>(resource.d_res.contents);
                     auto* dstp = reinterpret_cast<float*>(
                         vsapi->getWritePtr(dst.get(), plane));
                     if (radius != 0) {
                         int s_pitch = vsapi->getStride(src, plane);
-                        int out_height = vsapi->getFrameHeight(src, plane) * 2 *
-                                         temporal_width;
+                        int out_height = vsapi->getFrameHeight(src, plane) *
+                                         2 * temporal_width;
                         int width_bytes = static_cast<int>(
-                            vsapi->getFrameWidth(src, plane) * sizeof(float));
+                            vsapi->getFrameWidth(src, plane) *
+                            sizeof(float));
 
                         id<MTLCommandBuffer> outCmdBuf =
                             [resource.commandQueue commandBuffer];
@@ -505,29 +586,30 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                             [outCmdBuf computeCommandEncoder];
                         [outEnc setComputePipelineState:resource.copy_pso];
 
-                        encode_copy_to_vs(outEnc, d->device, resource.d_res,
-                                          reinterpret_cast<uint8_t*>(h_dst) -
-                                              reinterpret_cast<uint8_t*>(
-                                                  resource.d_res.contents),
-                                          d->d_pitch,
-                                          vsapi->getWritePtr(dst.get(), plane),
-                                          (size_t)out_height * s_pitch, s_pitch,
-                                          width_bytes, out_height);
+                        encode_copy_to_vs(
+                            outEnc, d->device, resource.d_res,
+                            reinterpret_cast<uint8_t*>(h_dst) -
+                                reinterpret_cast<uint8_t*>(
+                                    resource.d_res.contents),
+                            d->d_pitch,
+                            vsapi->getWritePtr(dst.get(), plane),
+                            (size_t)out_height * s_pitch, s_pitch,
+                            width_bytes, out_height);
 
                         [outEnc endEncoding];
                         [outCmdBuf commit];
                         [outCmdBuf waitUntilCompleted];
                     } else {
-                        Aggregation(dstp,
-                                    static_cast<int>(s_pitch / sizeof(float)),
-                                    h_dst, d_stride, width, height);
+                        Aggregation(
+                            dstp, static_cast<int>(s_pitch / sizeof(float)),
+                            h_dst, d_stride, width, height);
                     }
                 }
             }
         }
 
         d->resources_lock.lock();
-        d->resources.push_back(resource);
+        d->resources.push_back(std::move(resource));
         d->resources_lock.unlock();
         d->semaphore.release();
 
@@ -551,6 +633,12 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
 static void VS_CC BM3DFree(void* instanceData, [[maybe_unused]] VSCore* core,
                            const VSAPI* vsapi) noexcept {
     auto d = std::unique_ptr<BM3DData>(static_cast<BM3DData*>(instanceData));
+
+    @autoreleasepool {
+        d->resources.clear();
+        d->device = nil;
+    }
+
     vsapi->freeNode(d->node);
     if (d->ref_node != nullptr) {
         vsapi->freeNode(d->ref_node);
@@ -565,6 +653,8 @@ static void VS_CC BM3DCreate(const VSMap* in, VSMap* out,
 
     auto set_error = [&](const std::string& errorMessage) {
         vsapi->setError(out, ("BM3DMetal: " + errorMessage).c_str());
+        d->resources.clear();
+        d->device = nil;
         if (d->node) {
             vsapi->freeNode(d->node);
         }
@@ -746,19 +836,44 @@ static void VS_CC BM3DCreate(const VSMap* in, VSMap* out,
             (d->final_ ? 2 : 1) * num_planes * temporal_width * max_height;
         size_t res_buffer_height = num_planes * temporal_width * 2 * max_height;
 
+        std::string error_message;
+
         for (int i = 0; i < d->num_copy_engines; ++i) {
             Metal_Resource res;
+            size_t src_alloc_size = src_buffer_height * d->d_pitch;
             res.d_src =
-                [d->device newBufferWithLength:src_buffer_height * d->d_pitch
+                [d->device newBufferWithLength:src_alloc_size
                                        options:MTLResourceStorageModeShared];
+            if (res.d_src == nil) {
+                error_message = "Failed to allocate source buffer (size: "s +
+                                std::to_string(src_alloc_size) +
+                                " bytes). Out of memory?";
+                break;
+            }
+
+            size_t res_alloc_size = res_buffer_height * d->d_pitch;
             res.d_res =
-                [d->device newBufferWithLength:res_buffer_height * d->d_pitch
+                [d->device newBufferWithLength:res_alloc_size
                                        options:MTLResourceStorageModeShared];
+            if (res.d_res == nil) {
+                error_message = "Failed to allocate result buffer (size: "s +
+                                std::to_string(res_alloc_size) +
+                                " bytes). Out of memory?";
+                break;
+            }
             res.commandQueue = [d->device newCommandQueue];
+            if (res.commandQueue == nil) {
+                set_error("Failed to create command queue");
+                return;
+            }
 
             res.params =
                 [d->device newBufferWithLength:sizeof(KernelParams)
                                        options:MTLResourceStorageModeShared];
+            if (res.params == nil) {
+                set_error("Failed to allocate parameters buffer");
+                return;
+            }
 
             std::array<const char*, 8> kernel_names = {
                 "bm3d_false_false_false", "bm3d_false_false_true",
@@ -802,7 +917,7 @@ static void VS_CC BM3DCreate(const VSMap* in, VSMap* out,
                 return;
             }
 
-            d->resources.push_back(res);
+            d->resources.push_back(std::move(res));
         }
     }
 

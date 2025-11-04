@@ -68,8 +68,8 @@ METAL_FUNC T metal_shfl_sync(T value, int srcLane, int width,
 
 constant int smem_stride = 32 + 1;
 
-METAL_FUNC void atomic_add_float(device float* addr, float val) {
-    device atomic_uint* atomic_addr = (device atomic_uint*)addr;
+METAL_FUNC void atomic_add_float(device float *addr, float val) {
+    device atomic_uint *atomic_addr = (device atomic_uint *)addr;
     uint expected = atomic_load_explicit(atomic_addr, memory_order_relaxed);
     uint desired;
     float current;
@@ -86,21 +86,19 @@ METAL_FUNC void atomic_add_float(device float* addr, float val) {
 template <bool forward> void dct(thread float v[8]);
 
 template <bool forward, int stride = 1, int howmany = 8, int howmany_stride = 8>
-METAL_FUNC void transform_pack8_interleave4(thread float* data,
-                                            threadgroup float* buffer,
+METAL_FUNC void transform_pack8_interleave4(thread float *data,
+                                            threadgroup float *buffer,
                                             ushort tid_in_simdgroup) {
-    [[unroll]]
+
     for (int iter = 0; iter < howmany; ++iter, data += howmany_stride) {
         float v[8];
 
-        [[unroll]]
         for (int i = 0; i < 8; ++i) {
             v[i] = data[i * stride];
         }
 
         dct<forward>(v);
 
-        [[unroll]]
         for (int i = 0; i < 8; ++i) {
             data[i * stride] = v[i];
         }
@@ -216,21 +214,19 @@ template <bool forward> METAL_FUNC void dct(thread float v[8]) {
 }
 
 template <int stride = 1, int howmany = 8, int howmany_stride = 8>
-METAL_FUNC void transpose_pack8_interleave4(thread float* data,
-                                            threadgroup float* buffer,
+METAL_FUNC void transpose_pack8_interleave4(thread float *data,
+                                            threadgroup float *buffer,
                                             ushort tid_in_simdgroup) {
-    [[unroll]]
+
     for (int iter = 0; iter < howmany; ++iter, data += howmany_stride) {
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        [[unroll]]
         for (int i = 0; i < 8; ++i) {
             buffer[i * smem_stride + tid_in_simdgroup] = data[i * stride];
         }
 
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        [[unroll]]
         for (int i = 0; i < 8; ++i) {
             data[i * stride] = buffer[(tid_in_simdgroup % 8) * smem_stride +
                                       (tid_in_simdgroup & ~7) + i];
@@ -239,13 +235,12 @@ METAL_FUNC void transpose_pack8_interleave4(thread float* data,
 }
 
 template <int stride = 1>
-METAL_FUNC float hard_thresholding(thread float* data, float sigma,
+METAL_FUNC float hard_thresholding(thread float *data, float sigma,
                                    ushort tid_in_simdgroup) {
     constexpr float inv_norm = 1.0f / 4096.0f;
 
     float ks[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    [[unroll]]
     for (int i = 0; i < 64; ++i) {
         auto val = data[i * stride];
 
@@ -265,7 +260,6 @@ METAL_FUNC float hard_thresholding(thread float* data, float sigma,
 
     float k = (ks[0] + ks[1]) + (ks[2] + ks[3]);
 
-    [[unroll]]
     for (int i = 4; i >= 1; i /= 2) {
         k += metal_shfl_xor_sync(k, i, 8, tid_in_simdgroup);
     }
@@ -273,13 +267,12 @@ METAL_FUNC float hard_thresholding(thread float* data, float sigma,
     return 1.0f / k;
 }
 
-METAL_FUNC float collaborative_hard(thread float* denoising_patch, float sigma,
-                                    threadgroup float* buffer,
+METAL_FUNC float collaborative_hard(thread float *denoising_patch, float sigma,
+                                    threadgroup float *buffer,
                                     ushort tid_in_simdgroup) {
     constexpr int stride1 = 1;
     constexpr int stride2 = 8;
 
-    [[unroll]]
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8_interleave4<true, stride1, 8, stride2>(
             denoising_patch, buffer, tid_in_simdgroup);
@@ -292,7 +285,6 @@ METAL_FUNC float collaborative_hard(thread float* denoising_patch, float sigma,
     float adaptive_weight =
         hard_thresholding<stride1>(denoising_patch, sigma, tid_in_simdgroup);
 
-    [[unroll]]
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8_interleave4<false, stride1, 8, stride2>(
             denoising_patch, buffer, tid_in_simdgroup);
@@ -306,7 +298,7 @@ METAL_FUNC float collaborative_hard(thread float* denoising_patch, float sigma,
 }
 
 template <int stride = 1>
-METAL_FUNC float wiener_filtering(thread float* data, thread float* ref,
+METAL_FUNC float wiener_filtering(thread float *data, thread float *ref,
                                   float sigma, ushort tid_in_simdgroup) {
     constexpr float inv_norm = 1.0f / 4096.0f;
 
@@ -314,7 +306,6 @@ METAL_FUNC float wiener_filtering(thread float* data, thread float* ref,
 
     float sigma_sq = sigma * sigma;
 
-    [[unroll]]
     for (int i = 0; i < 64; ++i) {
         auto val = data[i * stride];
         auto ref_val = ref[i * stride];
@@ -332,7 +323,6 @@ METAL_FUNC float wiener_filtering(thread float* data, thread float* ref,
 
     float k = (ks[0] + ks[1]) + (ks[2] + ks[3]);
 
-    [[unroll]]
     for (int i = 4; i >= 1; i /= 2) {
         k += metal_shfl_xor_sync(k, i, 8, tid_in_simdgroup);
     }
@@ -340,14 +330,13 @@ METAL_FUNC float wiener_filtering(thread float* data, thread float* ref,
     return 1.0f / k;
 }
 
-METAL_FUNC float collaborative_wiener(thread float* denoising_patch,
-                                      thread float* ref_patch, float sigma,
-                                      threadgroup float* buffer,
+METAL_FUNC float collaborative_wiener(thread float *denoising_patch,
+                                      thread float *ref_patch, float sigma,
+                                      threadgroup float *buffer,
                                       ushort tid_in_simdgroup) {
     constexpr int stride1 = 1;
     constexpr int stride2 = 8;
 
-    [[unroll]]
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8_interleave4<true, stride1, 8, stride2>(
             denoising_patch, buffer, tid_in_simdgroup);
@@ -357,7 +346,6 @@ METAL_FUNC float collaborative_wiener(thread float* denoising_patch,
     transform_pack8_interleave4<true, stride2, 8, stride1>(
         denoising_patch, buffer, tid_in_simdgroup);
 
-    [[unroll]]
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8_interleave4<true, stride1, 8, stride2>(
             ref_patch, buffer, tid_in_simdgroup);
@@ -370,7 +358,6 @@ METAL_FUNC float collaborative_wiener(thread float* denoising_patch,
     float adaptive_weight = wiener_filtering<stride1>(
         denoising_patch, ref_patch, sigma, tid_in_simdgroup);
 
-    [[unroll]]
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8_interleave4<false, stride1, 8, stride2>(
             denoising_patch, buffer, tid_in_simdgroup);
@@ -400,10 +387,10 @@ struct KernelParams {
 
 // Common BM3D kernel logic
 template <bool temporal, bool chroma, bool final_>
-METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
-                                  constant KernelParams& params, uint2 gid,
+METAL_FUNC void bm3d_kernel_logic(device float *res, device const float *src,
+                                  constant KernelParams &params, uint2 gid,
                                   ushort tid_in_simdgroup,
-                                  threadgroup float* buffer) {
+                                  threadgroup float *buffer) {
     float sigma = params.sigma;
     const int sub_lane_id = tid_in_simdgroup % 8;
     int x = (4 * gid.x + tid_in_simdgroup / 8) * params.block_step;
@@ -427,12 +414,12 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
     int clip_stride = (chroma ? 3 : 1) * temporal_width * temporal_stride;
 
     float current_patch[8];
-    device const float* const srcpc =
+    device const float *const srcpc =
         &src[radius * temporal_stride + sub_lane_id];
 
     {
-        device const float* srcp = &srcpc[y * params.stride + x];
-        [[unroll]]
+        device const float *srcp = &srcpc[y * params.stride + x];
+
         for (int i = 0; i < 8; ++i) {
             current_patch[i] = srcp[i * params.stride];
         }
@@ -449,16 +436,15 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
         int top = max(y - params.bm_range, 0);
         int bottom = min(y + params.bm_range, params.height - 8);
 
-        device const float* srcp_row = &srcpc[top * params.stride + left];
+        device const float *srcp_row = &srcpc[top * params.stride + left];
         for (int row_i = top; row_i <= bottom; ++row_i) {
-            device const float* srcp_col = srcp_row;
+            device const float *srcp_col = srcp_row;
             for (int col_i = left; col_i <= right; ++col_i) {
                 float errors[2] = {0.0f, 0.0f};
-                device const float* srcp = srcp_col;
+                device const float *srcp = srcp_col;
 
                 simdgroup_barrier(mem_flags::mem_none);
 
-                [[unroll]]
                 for (int i = 0; i < 8; ++i) {
                     float val = current_patch[i] - srcp[i * params.stride];
                     errors[i % 2] += val * val;
@@ -466,7 +452,6 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
 
                 float error = errors[0] + errors[1];
 
-                [[unroll]]
                 for (int i = 4; i >= 1; i /= 2) {
                     error += metal_shfl_xor_sync(error, i, 8, tid_in_simdgroup);
                 }
@@ -509,7 +494,7 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
                 int frame_index8_x = 0;
                 int frame_index8_y = 0;
 
-                device const float* temporal_srcpc =
+                device const float *temporal_srcpc =
                     &src[temporal_index * temporal_stride + sub_lane_id];
 
                 for (int i = 0; i < params.ps_num; ++i) {
@@ -523,17 +508,16 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
                     int top = max(yy - params.ps_range, 0);
                     int bottom = min(yy + params.ps_range, params.height - 8);
 
-                    device const float* srcp_row =
+                    device const float *srcp_row =
                         &temporal_srcpc[top * params.stride + left];
                     for (int row_i = top; row_i <= bottom; ++row_i) {
-                        device const float* srcp_col = srcp_row;
+                        device const float *srcp_col = srcp_row;
                         for (int col_i = left; col_i <= right; ++col_i) {
                             float errors[2] = {0.0f, 0.0f};
-                            device const float* srcp = srcp_col;
+                            device const float *srcp = srcp_col;
 
                             simdgroup_barrier(mem_flags::mem_none);
 
-                            [[unroll]]
                             for (int j = 0; j < 8; ++j) {
                                 float val =
                                     current_patch[j] - srcp[j * params.stride];
@@ -542,7 +526,6 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
 
                             float error = errors[0] + errors[1];
 
-                            [[unroll]]
                             for (int i = 4; i >= 1; i /= 2) {
                                 error += metal_shfl_xor_sync(error, i, 8,
                                                              tid_in_simdgroup);
@@ -613,7 +596,7 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
             flag_val = (index8_x == x && index8_y == y);
         }
         float flag = flag_val;
-        [[unroll]]
+
         for (int i = 4; i >= 1; i /= 2) {
             flag += metal_shfl_xor_sync(flag, i, 8, tid_in_simdgroup);
         }
@@ -656,11 +639,11 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
 
         float adaptive_weight;
         if constexpr (final_) {
-            [[unroll]]
+
             for (int i = 0; i < 8; ++i) {
                 int tmp_x = metal_shfl_sync(index8_x, i, 8, tid_in_simdgroup);
                 int tmp_y = metal_shfl_sync(index8_y, i, 8, tid_in_simdgroup);
-                device const float* refp;
+                device const float *refp;
                 if constexpr (temporal) {
                     int tmp_z =
                         metal_shfl_sync(index8_z, i, 8, tid_in_simdgroup);
@@ -669,9 +652,8 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
                 } else {
                     refp = &src[tmp_y * params.stride + tmp_x + sub_lane_id];
                 }
-                device const float* srcp = &refp[clip_stride];
+                device const float *srcp = &refp[clip_stride];
 
-                [[unroll]]
                 for (int j = 0; j < 8; ++j) {
                     ref_patch[i * 8 + j] = refp[j * params.stride];
                     denoising_patch[i * 8 + j] = srcp[j * params.stride];
@@ -680,11 +662,11 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
             adaptive_weight = collaborative_wiener(
                 denoising_patch, ref_patch, sigma, buffer, tid_in_simdgroup);
         } else {
-            [[unroll]]
+
             for (int i = 0; i < 8; ++i) {
                 int tmp_x = metal_shfl_sync(index8_x, i, 8, tid_in_simdgroup);
                 int tmp_y = metal_shfl_sync(index8_y, i, 8, tid_in_simdgroup);
-                device const float* srcp;
+                device const float *srcp;
                 if constexpr (temporal) {
                     int tmp_z =
                         metal_shfl_sync(index8_z, i, 8, tid_in_simdgroup);
@@ -694,7 +676,6 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
                     srcp = &src[tmp_y * params.stride + tmp_x + sub_lane_id];
                 }
 
-                [[unroll]]
                 for (int j = 0; j < 8; ++j) {
                     denoising_patch[i * 8 + j] = srcp[j * params.stride];
                 }
@@ -703,10 +684,9 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
                                                  tid_in_simdgroup);
         }
 
-        device float* const wdstpc = &res[sub_lane_id];
-        device float* const weightpc = &res[temporal_stride + sub_lane_id];
+        device float *const wdstpc = &res[sub_lane_id];
+        device float *const weightpc = &res[temporal_stride + sub_lane_id];
 
-        [[unroll]]
         for (int i = 0; i < 8; ++i) {
             int tmp_x = metal_shfl_sync(index8_x, i, 8, tid_in_simdgroup);
             int tmp_y = metal_shfl_sync(index8_y, i, 8, tid_in_simdgroup);
@@ -719,10 +699,9 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
                 offset = tmp_y * params.stride + tmp_x;
             }
 
-            device float* wdstp = &wdstpc[offset];
-            device float* weightp = &weightpc[offset];
+            device float *wdstp = &wdstpc[offset];
+            device float *weightp = &weightpc[offset];
 
-            [[unroll]]
             for (int j = 0; j < 8; ++j) {
                 float wdst_val = adaptive_weight * denoising_patch[i * 8 + j];
                 float weight_val = adaptive_weight;
@@ -741,12 +720,12 @@ METAL_FUNC void bm3d_kernel_logic(device float* res, device const float* src,
 }
 
 #define DECLARE_BM3D_KERNEL(name, temporal_val, chroma_val, final_val)         \
-    kernel void name(device float* res [[buffer(0)]],                          \
-                     device const float* src [[buffer(1)]],                    \
-                     constant KernelParams& params [[buffer(2)]],              \
+    kernel void name(device float *res [[buffer(0)]],                          \
+                     device const float *src [[buffer(1)]],                    \
+                     constant KernelParams &params [[buffer(2)]],              \
                      uint2 gid [[threadgroup_position_in_grid]],               \
                      ushort tid_in_simdgroup [[thread_index_in_simdgroup]],    \
-                     threadgroup float* buffer [[threadgroup(0)]]) {           \
+                     threadgroup float *buffer [[threadgroup(0)]]) {           \
         bm3d_kernel_logic<temporal_val, chroma_val, final_val>(                \
             res, src, params, gid, tid_in_simdgroup, buffer);                  \
     }
@@ -763,11 +742,11 @@ DECLARE_BM3D_KERNEL(bm3d_true_false_true, true, false, true)
 DECLARE_BM3D_KERNEL(bm3d_true_true_false, true, true, false)
 DECLARE_BM3D_KERNEL(bm3d_true_true_true, true, true, true)
 
-kernel void copy_kernel(device const char* src [[buffer(0)]],
-                        device char* dst [[buffer(1)]],
-                        constant uint& src_stride_bytes [[buffer(2)]],
-                        constant uint& dst_stride_bytes [[buffer(3)]],
-                        constant uint& width_bytes [[buffer(4)]],
+kernel void copy_kernel(device const char *src [[buffer(0)]],
+                        device char *dst [[buffer(1)]],
+                        constant uint &src_stride_bytes [[buffer(2)]],
+                        constant uint &dst_stride_bytes [[buffer(3)]],
+                        constant uint &width_bytes [[buffer(4)]],
                         uint2 tid [[thread_position_in_grid]]) {
     if (tid.x >= width_bytes) {
         return;

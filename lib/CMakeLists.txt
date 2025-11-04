@@ -9,7 +9,10 @@ add_library(bm3dmetal SHARED
     bm3dmetal.mm
 )
 
-set_target_properties(bm3dmetal PROPERTIES CXX_FLAGS "-Wno-c23-extensions -mmacosx-version-min=12.0")
+set_target_properties(bm3dmetal PROPERTIES 
+    CXX_FLAGS "-Wno-c23-extensions -mmacosx-version-min=12.0"
+    COMPILE_FLAGS "-fobjc-arc"
+)
 
 find_library(METAL_FRAMEWORK Metal REQUIRED)
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
