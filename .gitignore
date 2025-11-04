@@ -1,0 +1,8 @@
+.cursor/*
+.DS_Store
+.cache/*
+.codacy/*
+.vscode/*
+build/*
+builddir/*
+cuda-impl/*

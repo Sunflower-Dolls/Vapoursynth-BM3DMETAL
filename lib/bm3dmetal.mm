@@ -1,0 +1,1090 @@
+/**
+ * Copyright (C) 2021 WolframRhodium
+ * Copyright (C) 2025 Sunflower Dolls
+ *
+ * This file is part of Vapoursynth-BM3DMETAL.
+ *
+ * Vapoursynth-BM3DMETAL is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Vapoursynth-BM3DMETAL is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with Vapoursynth-BM3DMETAL.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#import <Accelerate/Accelerate.h>
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <concepts>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <thread>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "../include/VSHelper.h"
+#include "../include/VapourSynth.h"
+
+using namespace std::string_literals;
+
+[[nodiscard]] inline bool handle_metal_error(NSError* err,
+                                             const std::string& message,
+                                             VSFrameContext* context,
+                                             const VSAPI* vsapi) noexcept {
+    if (err != nullptr) {
+        vsapi->setFilterError(
+            (message + [err.localizedDescription UTF8String]).c_str(), context);
+        return true;
+    }
+    return handle_metal_error(err, message, context, vsapi);
+}
+
+static inline void encode_copy_from_vs(id<MTLComputeCommandEncoder> encoder,
+                                       id<MTLDevice> device,
+                                       const void* src_ptr, size_t src_len,
+                                       uint src_stride, id<MTLBuffer> dst_buf,
+                                       size_t dst_offset, uint dst_stride,
+                                       uint width_bytes, uint height) {
+    id<MTLBuffer> src_buf =
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+        [device newBufferWithBytesNoCopy:const_cast<void*>(src_ptr)
+                                  length:src_len
+                                 options:MTLResourceStorageModeShared
+                             deallocator:nil];
+
+    [encoder setBuffer:src_buf offset:0 atIndex:0];
+    [encoder setBuffer:dst_buf offset:dst_offset atIndex:1];
+    [encoder setBytes:&src_stride length:sizeof(uint) atIndex:2];
+    [encoder setBytes:&dst_stride length:sizeof(uint) atIndex:3];
+    [encoder setBytes:&width_bytes length:sizeof(uint) atIndex:4];
+
+    MTLSize grid = MTLSizeMake(width_bytes, height, 1);
+    MTLSize group = MTLSizeMake(std::min((int)width_bytes, 32),
+                                std::min((int)height, 32), 1);
+    [encoder dispatchThreads:grid threadsPerThreadgroup:group];
+}
+
+static inline void encode_copy_to_vs(id<MTLComputeCommandEncoder> encoder,
+                                     id<MTLDevice> device,
+                                     id<MTLBuffer> src_buf, size_t src_offset,
+                                     uint src_stride, void* dst_ptr,
+                                     size_t dst_len, uint dst_stride,
+                                     uint width_bytes, uint height) {
+    id<MTLBuffer> dst_buf =
+        [device newBufferWithBytesNoCopy:dst_ptr
+                                  length:dst_len
+                                 options:MTLResourceStorageModeShared
+                             deallocator:nil];
+
+    [encoder setBuffer:src_buf offset:src_offset atIndex:0];
+    [encoder setBuffer:dst_buf offset:0 atIndex:1];
+    [encoder setBytes:&src_stride length:sizeof(uint) atIndex:2];
+    [encoder setBytes:&dst_stride length:sizeof(uint) atIndex:3];
+    [encoder setBytes:&width_bytes length:sizeof(uint) atIndex:4];
+
+    MTLSize grid = MTLSizeMake(width_bytes, height, 1);
+    MTLSize group = MTLSizeMake(std::min((int)width_bytes, 32),
+                                std::min((int)height, 32), 1);
+    [encoder dispatchThreads:grid threadsPerThreadgroup:group];
+}
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+static VSPlugin* myself = nullptr;
+
+struct ticket_semaphore {
+    std::atomic<intptr_t> ticket;
+    std::atomic<intptr_t> current;
+
+    void acquire() noexcept {
+        intptr_t tk = ticket.fetch_add(1, std::memory_order::acquire);
+        while (true) {
+            intptr_t curr = current.load(std::memory_order::acquire);
+            if (tk <= curr) {
+                return;
+            }
+            current.wait(curr, std::memory_order::relaxed);
+        }
+    }
+
+    void release() noexcept {
+        current.fetch_add(1, std::memory_order::release);
+        current.notify_all();
+    }
+};
+
+struct KernelParams {
+    int width;
+    int height;
+    int stride;
+    float sigma;
+    int block_step;
+    int bm_range;
+    int radius;
+    int ps_num;
+    int ps_range;
+    float sigma_u;
+    float sigma_v;
+    float extractor;
+};
+
+struct Metal_Resource {
+    id<MTLBuffer> d_src;
+    id<MTLBuffer> d_res;
+    id<MTLCommandQueue> commandQueue;
+    std::array<id<MTLComputePipelineState>, 8> psos;
+    id<MTLComputePipelineState> copy_pso;
+    id<MTLBuffer> params;
+};
+
+struct BM3DData {
+    VSNodeRef* node;
+    VSNodeRef* ref_node;
+    const VSVideoInfo* vi;
+
+    std::array<float, 3> sigma;
+    std::array<int, 3> block_step;
+    std::array<int, 3> bm_range;
+    std::array<int, 3> ps_num;
+    std::array<int, 3> ps_range;
+    float extractor;
+
+    int radius;
+    int num_copy_engines;
+    bool chroma;
+    std::array<bool, 3> process;
+    bool final_;
+    bool zero_init;
+
+    size_t d_pitch;
+    id<MTLDevice> device;
+
+    ticket_semaphore semaphore;
+    std::vector<Metal_Resource> resources;
+    std::mutex resources_lock;
+};
+
+static inline void Aggregation(float* __restrict dstp, int dst_stride,
+                               const float* __restrict srcp, int src_stride,
+                               int width, int height) noexcept {
+    const float* wdst = srcp;
+    const float* weight = &srcp[(size_t)height * src_stride];
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            dstp[x] = wdst[x] / (weight[x] > 0 ? weight[x] : 1.F);
+        }
+        dstp += dst_stride;
+        wdst += src_stride;
+        weight += src_stride;
+    }
+}
+
+static void VS_CC BM3DInit([[maybe_unused]] VSMap* in,
+                           [[maybe_unused]] VSMap* out, void** instanceData,
+                           VSNode* node, [[maybe_unused]] VSCore* core,
+                           const VSAPI* vsapi) noexcept {
+    auto* d = static_cast<BM3DData*>(*instanceData);
+    if (d->radius != 0) {
+        VSVideoInfo vi = *d->vi;
+        vi.height *= 2 * (2 * d->radius + 1);
+        vsapi->setVideoInfo(&vi, 1, node);
+    } else {
+        vsapi->setVideoInfo(d->vi, 1, node);
+    }
+}
+
+static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
+                                            void** instanceData,
+                                            [[maybe_unused]] void** frameData,
+                                            VSFrameContext* frameCtx,
+                                            VSCore* core,
+                                            const VSAPI* vsapi) noexcept {
+    auto* d = static_cast<BM3DData*>(*instanceData);
+
+    if (activationReason == arInitial) {
+        int start_frame = std::max(n - d->radius, 0);
+        int end_frame = std::min(n + d->radius, d->vi->numFrames - 1);
+        for (int i = start_frame; i <= end_frame; ++i) {
+            vsapi->requestFrameFilter(i, d->node, frameCtx);
+        }
+        if (d->final_) {
+            for (int i = start_frame; i <= end_frame; ++i) {
+                vsapi->requestFrameFilter(i, d->ref_node, frameCtx);
+            }
+        }
+    } else if (activationReason == arAllFramesReady) {
+        int radius = d->radius;
+        int temporal_width = (2 * radius) + 1;
+        bool final_ = d->final_;
+        int num_input_frames = temporal_width * (final_ ? 2 : 1);
+
+        using freeFrame_t = decltype(vsapi->freeFrame);
+        const auto srcs = [&]() {
+            std::vector<std::unique_ptr<const VSFrameRef, const freeFrame_t&>>
+                temp;
+            temp.reserve(num_input_frames);
+            if (final_) {
+                for (int i = -radius; i <= radius; ++i) {
+                    temp.emplace_back(
+                        vsapi->getFrameFilter(
+                            std::clamp(n + i, 0, d->vi->numFrames - 1),
+                            d->ref_node, frameCtx),
+                        vsapi->freeFrame);
+                }
+            }
+            for (int i = -radius; i <= radius; ++i) {
+                temp.emplace_back(
+                    vsapi->getFrameFilter(
+                        std::clamp(n + i, 0, d->vi->numFrames - 1), d->node,
+                        frameCtx),
+                    vsapi->freeFrame);
+            }
+            return temp;
+        }();
+
+        const VSFrameRef* src =
+            srcs[radius + (final_ ? temporal_width : 0)].get();
+        std::unique_ptr<VSFrameRef, const freeFrame_t&> dst{nullptr,
+                                                            vsapi->freeFrame};
+
+        if (radius != 0) {
+            dst.reset(vsapi->newVideoFrame(d->vi->format, d->vi->width,
+                                           d->vi->height * 2 * temporal_width,
+                                           src, core));
+            for (int i = 0; i < d->vi->format->numPlanes; ++i) {
+                if (d->zero_init && !d->process.at(i)) {
+                    memset(vsapi->getWritePtr(dst.get(), i), 0,
+                           (size_t)vsapi->getFrameHeight(dst.get(), i) *
+                               vsapi->getStride(dst.get(), i));
+                }
+            }
+        } else {
+            std::array<const VSFrameRef*, 3> fr = {
+                d->process[0] ? nullptr : src, d->process[1] ? nullptr : src,
+                d->process[2] ? nullptr : src};
+            std::array<int, 3> plane_indices = {0, 1, 2};
+            dst.reset(vsapi->newVideoFrame2(d->vi->format, d->vi->width,
+                                            d->vi->height, fr.data(),
+                                            plane_indices.data(), src, core));
+        }
+
+        d->semaphore.acquire();
+        d->resources_lock.lock();
+        auto resource = d->resources.back();
+        d->resources.pop_back();
+        d->resources_lock.unlock();
+
+        @autoreleasepool {
+            int temporal_width = (2 * d->radius) + 1;
+            int num_planes = d->chroma ? 3 : 1;
+            int max_height = d->process[0] ? vsapi->getFrameHeight(src, 0)
+                                           : vsapi->getFrameHeight(src, 1);
+            size_t res_buffer_size = (size_t)num_planes * temporal_width * 2 *
+                                     max_height * d->d_pitch;
+            memset(resource.d_res.contents, 0, res_buffer_size);
+
+            if (d->chroma) {
+                id<MTLCommandBuffer> commandBuffer =
+                    [resource.commandQueue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder =
+                    [commandBuffer computeCommandEncoder];
+
+                [encoder setComputePipelineState:resource.copy_pso];
+
+                size_t d_src_offset = 0;
+
+                for (int outer = 0; outer < (final_ ? 2 : 1); ++outer) {
+                    for (int i = 0; i < 3; ++i) {
+                        int height = vsapi->getFrameHeight(src, i);
+                        for (int j = 0; j < temporal_width; ++j) {
+                            if (i == 0 || d->process.at(i)) {
+                                const VSFrameRef* frame =
+                                    srcs[j + (outer * temporal_width)].get();
+                                int s_pitch = vsapi->getStride(frame, i);
+                                int width_bytes = static_cast<int>(
+                                    vsapi->getFrameWidth(frame, i) *
+                                    sizeof(float));
+                                const auto* p_read =
+                                    vsapi->getReadPtr(frame, i);
+
+                                encode_copy_from_vs(encoder, d->device, p_read,
+                                                    (size_t)height * s_pitch,
+                                                    s_pitch, resource.d_src,
+                                                    d_src_offset, d->d_pitch,
+                                                    width_bytes, height);
+                            }
+                            d_src_offset += d->d_pitch * height;
+                        }
+                    }
+                }
+
+                int width = vsapi->getFrameWidth(src, 0);
+                int height = vsapi->getFrameHeight(src, 0);
+                int d_stride = static_cast<int>(d->d_pitch / sizeof(float));
+
+                int pso_idx = (static_cast<int>(d->radius > 0) * 4) + (1 * 2) +
+                              static_cast<int>(d->final_);
+                [encoder setComputePipelineState:resource.psos.at(pso_idx)];
+
+                [encoder setBuffer:resource.d_res offset:0 atIndex:0];
+                [encoder setBuffer:resource.d_src offset:0 atIndex:1];
+
+                auto* params =
+                    static_cast<KernelParams*>([resource.params contents]);
+                params->width = width;
+                params->height = height;
+                params->stride = d_stride;
+                params->sigma = d->sigma[0];
+                params->block_step = d->block_step[0];
+                params->bm_range = d->bm_range[0];
+                params->radius = d->radius;
+                params->ps_num = d->ps_num[0];
+                params->ps_range = d->ps_range[0];
+                params->sigma_u = d->sigma[1];
+                params->sigma_v = d->sigma[2];
+                params->extractor = d->extractor;
+
+                [encoder setBuffer:resource.params offset:0 atIndex:2];
+                [encoder setThreadgroupMemoryLength:sizeof(float) * 8 * (32 + 1)
+                                            atIndex:0];
+
+                MTLSize gridDim = MTLSizeMake(
+                    (width + (4 * d->block_step[0] - 1)) /
+                        (4 * d->block_step[0]),
+                    (height + (d->block_step[0] - 1)) / d->block_step[0], 1);
+                [encoder dispatchThreadgroups:gridDim
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+                [encoder endEncoding];
+                [commandBuffer commit];
+                [commandBuffer waitUntilCompleted];
+
+                auto* h_dst = static_cast<float*>(resource.d_res.contents);
+                for (int plane = 0; plane < 3; ++plane) {
+                    if (!d->process.at(plane)) {
+                        h_dst += (size_t)d_stride * height * 2 * temporal_width;
+                        continue;
+                    }
+                    const int s_pitch = vsapi->getStride(src, plane);
+
+                    if (radius != 0) {
+                        int out_height = vsapi->getFrameHeight(src, plane) * 2 *
+                                         temporal_width;
+                        int width_bytes = static_cast<int>(
+                            vsapi->getFrameWidth(src, plane) * sizeof(float));
+
+                        id<MTLCommandBuffer> outCmdBuf =
+                            [resource.commandQueue commandBuffer];
+                        id<MTLComputeCommandEncoder> outEnc =
+                            [outCmdBuf computeCommandEncoder];
+                        [outEnc setComputePipelineState:resource.copy_pso];
+
+                        encode_copy_to_vs(outEnc, d->device, resource.d_res,
+                                          reinterpret_cast<uint8_t*>(h_dst) -
+                                              reinterpret_cast<uint8_t*>(
+                                                  resource.d_res.contents),
+                                          d->d_pitch,
+                                          vsapi->getWritePtr(dst.get(), plane),
+                                          (size_t)out_height * s_pitch, s_pitch,
+                                          width_bytes, out_height);
+
+                        [outEnc endEncoding];
+                        [outCmdBuf commit];
+                        [outCmdBuf waitUntilCompleted];
+                    } else {
+                        Aggregation(reinterpret_cast<float*>(
+                                        vsapi->getWritePtr(dst.get(), plane)),
+                                    static_cast<int>(s_pitch / sizeof(float)),
+                                    h_dst, d_stride, width, height);
+                    }
+                    h_dst += (size_t)d_stride * height * 2 * temporal_width;
+                }
+            } else {
+                for (int plane = 0; plane < d->vi->format->numPlanes; ++plane) {
+                    if (!d->process.at(plane)) {
+                        continue;
+                    }
+
+                    int width = vsapi->getFrameWidth(src, plane);
+                    int height = vsapi->getFrameHeight(src, plane);
+                    int s_pitch = vsapi->getStride(src, plane);
+                    int d_stride = static_cast<int>(d->d_pitch / sizeof(float));
+                    int width_bytes = static_cast<int>(width * sizeof(float));
+
+                    size_t res_size =
+                        (size_t)temporal_width * 2 * height * d->d_pitch;
+                    memset(resource.d_res.contents, 0, res_size);
+
+                    id<MTLCommandBuffer> commandBuffer =
+                        [resource.commandQueue commandBuffer];
+                    id<MTLComputeCommandEncoder> encoder =
+                        [commandBuffer computeCommandEncoder];
+
+                    [encoder setComputePipelineState:resource.copy_pso];
+
+                    size_t d_src_offset = 0;
+                    for (int i = 0; i < num_input_frames; ++i) {
+                        const VSFrameRef* frame = srcs[i].get();
+                        encode_copy_from_vs(
+                            encoder, d->device, vsapi->getReadPtr(frame, plane),
+                            (size_t)height * s_pitch, s_pitch, resource.d_src,
+                            d_src_offset, d->d_pitch, width_bytes, height);
+                        d_src_offset += d->d_pitch * height;
+                    }
+
+                    int pso_idx = (static_cast<int>(d->radius > 0) * 4) +
+                                  (0 * 2) + static_cast<int>(d->final_);
+                    [encoder setComputePipelineState:resource.psos.at(pso_idx)];
+
+                    [encoder setBuffer:resource.d_res offset:0 atIndex:0];
+                    [encoder setBuffer:resource.d_src offset:0 atIndex:1];
+
+                    auto* params =
+                        static_cast<KernelParams*>([resource.params contents]);
+                    params->width = width;
+                    params->height = height;
+                    params->stride = d_stride;
+                    params->sigma = d->sigma.at(plane);
+                    params->block_step = d->block_step.at(plane);
+                    params->bm_range = d->bm_range.at(plane);
+                    params->radius = d->radius;
+                    params->ps_num = d->ps_num.at(plane);
+                    params->ps_range = d->ps_range.at(plane);
+                    params->sigma_u = 0.F;
+                    params->sigma_v = 0.F;
+                    params->extractor = d->extractor;
+
+                    [encoder setBuffer:resource.params offset:0 atIndex:2];
+                    [encoder
+                        setThreadgroupMemoryLength:sizeof(float) * 8 * (32 + 1)
+                                           atIndex:0];
+
+                    MTLSize gridDim = MTLSizeMake(
+                        (width + (4 * d->block_step.at(plane) - 1)) /
+                            (4 * d->block_step.at(plane)),
+                        (height + (d->block_step.at(plane) - 1)) /
+                            d->block_step.at(plane),
+                        1);
+                    [encoder dispatchThreadgroups:gridDim
+                            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+                    [encoder endEncoding];
+                    [commandBuffer commit];
+                    [commandBuffer waitUntilCompleted];
+
+                    auto* h_dst = static_cast<float*>(resource.d_res.contents);
+                    auto* dstp = reinterpret_cast<float*>(
+                        vsapi->getWritePtr(dst.get(), plane));
+                    if (radius != 0) {
+                        int s_pitch = vsapi->getStride(src, plane);
+                        int out_height = vsapi->getFrameHeight(src, plane) * 2 *
+                                         temporal_width;
+                        int width_bytes = static_cast<int>(
+                            vsapi->getFrameWidth(src, plane) * sizeof(float));
+
+                        id<MTLCommandBuffer> outCmdBuf =
+                            [resource.commandQueue commandBuffer];
+                        id<MTLComputeCommandEncoder> outEnc =
+                            [outCmdBuf computeCommandEncoder];
+                        [outEnc setComputePipelineState:resource.copy_pso];
+
+                        encode_copy_to_vs(outEnc, d->device, resource.d_res,
+                                          reinterpret_cast<uint8_t*>(h_dst) -
+                                              reinterpret_cast<uint8_t*>(
+                                                  resource.d_res.contents),
+                                          d->d_pitch,
+                                          vsapi->getWritePtr(dst.get(), plane),
+                                          (size_t)out_height * s_pitch, s_pitch,
+                                          width_bytes, out_height);
+
+                        [outEnc endEncoding];
+                        [outCmdBuf commit];
+                        [outCmdBuf waitUntilCompleted];
+                    } else {
+                        Aggregation(dstp,
+                                    static_cast<int>(s_pitch / sizeof(float)),
+                                    h_dst, d_stride, width, height);
+                    }
+                }
+            }
+        }
+
+        d->resources_lock.lock();
+        d->resources.push_back(resource);
+        d->resources_lock.unlock();
+        d->semaphore.release();
+
+        if (radius != 0) {
+            VSMap* dst_prop = vsapi->getFramePropsRW(dst.get());
+            vsapi->propSetInt(dst_prop, "BM3D_V_radius", d->radius, paReplace);
+            std::array<int64_t, 3> process = {
+                static_cast<int64_t>(d->process[0]),
+                static_cast<int64_t>(d->process[1]),
+                static_cast<int64_t>(d->process[2])};
+            vsapi->propSetIntArray(dst_prop, "BM3D_V_process", process.data(),
+                                   3);
+        }
+
+        return dst.release();
+    }
+
+    return nullptr;
+}
+
+static void VS_CC BM3DFree(void* instanceData, [[maybe_unused]] VSCore* core,
+                           const VSAPI* vsapi) noexcept {
+    auto d = std::unique_ptr<BM3DData>(static_cast<BM3DData*>(instanceData));
+    vsapi->freeNode(d->node);
+    if (d->ref_node != nullptr) {
+        vsapi->freeNode(d->ref_node);
+    }
+}
+
+static void VS_CC BM3DCreate(const VSMap* in, VSMap* out,
+                             [[maybe_unused]] void* userData, VSCore* core,
+                             const VSAPI* vsapi) noexcept {
+    auto d = std::make_unique<BM3DData>();
+    int err = 0;
+
+    auto set_error = [&](const std::string& errorMessage) {
+        vsapi->setError(out, ("BM3DMetal: " + errorMessage).c_str());
+        if (d->node) {
+            vsapi->freeNode(d->node);
+        }
+        if (d->ref_node) {
+            vsapi->freeNode(d->ref_node);
+        }
+    };
+
+    d->node = vsapi->propGetNode(in, "clip", 0, nullptr);
+    d->vi = vsapi->getVideoInfo(d->node);
+
+    if (d->vi->format->sampleType != stFloat ||
+        d->vi->format->bitsPerSample != 32 || (isConstantFormat(d->vi) == 0)) {
+        set_error("only constant format 32bit float input supported");
+        return;
+    }
+
+    d->ref_node = vsapi->propGetNode(in, "ref", 0, &err);
+    d->final_ = (err == 0);
+    if (d->final_) {
+        const VSVideoInfo* ref_vi = vsapi->getVideoInfo(d->ref_node);
+        if (ref_vi->format->id != d->vi->format->id ||
+            ref_vi->width != d->vi->width || ref_vi->height != d->vi->height ||
+            ref_vi->numFrames != d->vi->numFrames) {
+            set_error("ref clip properties must match input clip");
+            return;
+        }
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        d->sigma.at(i) =
+            static_cast<float>(vsapi->propGetFloat(in, "sigma", i, &err));
+        if (err != 0) {
+            d->sigma.at(i) = (i == 0) ? 3.0F : d->sigma.at(i - 1);
+        }
+        if (d->sigma.at(i) < 0.0F) {
+            set_error("sigma must be non-negative");
+            return;
+        }
+        d->process.at(i) =
+            d->sigma.at(i) >= std::numeric_limits<float>::epsilon();
+        d->sigma.at(i) *=
+            (3.0F / 4.0F) / 255.0F * 64.0F * (d->final_ ? 1.0F : 2.7F);
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        d->block_step.at(i) =
+            static_cast<int>(vsapi->propGetInt(in, "block_step", i, &err));
+        if (err != 0) {
+            d->block_step.at(i) = (i == 0) ? 8 : d->block_step.at(i - 1);
+        }
+        if (d->block_step.at(i) <= 0 || d->block_step.at(i) > 8) {
+            set_error("block_step must be in [1, 8]");
+            return;
+        }
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        d->bm_range.at(i) =
+            static_cast<int>(vsapi->propGetInt(in, "bm_range", i, &err));
+        if (err != 0) {
+            d->bm_range.at(i) = (i == 0) ? 9 : d->bm_range.at(i - 1);
+        }
+        if (d->bm_range.at(i) <= 0) {
+            set_error("bm_range must be positive");
+            return;
+        }
+    }
+
+    d->radius = static_cast<int>(vsapi->propGetInt(in, "radius", 0, &err));
+    if (err != 0) {
+        d->radius = 0;
+    }
+    if (d->radius < 0) {
+        set_error("radius must be non-negative");
+        return;
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        d->ps_num.at(i) =
+            static_cast<int>(vsapi->propGetInt(in, "ps_num", i, &err));
+        if (err != 0) {
+            d->ps_num.at(i) = (i == 0) ? 2 : d->ps_num.at(i - 1);
+        }
+        if (d->ps_num.at(i) <= 0 || d->ps_num.at(i) > 8) {
+            set_error("ps_num must be in [1, 8]");
+            return;
+        }
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        d->ps_range.at(i) =
+            static_cast<int>(vsapi->propGetInt(in, "ps_range", i, &err));
+        if (err != 0) {
+            d->ps_range.at(i) = (i == 0) ? 4 : d->ps_range.at(i - 1);
+        }
+        if (d->ps_range.at(i) <= 0) {
+            set_error("ps_range must be positive");
+            return;
+        }
+    }
+
+    d->chroma = (vsapi->propGetInt(in, "chroma", 0, &err) != 0);
+    if (d->chroma && d->vi->format->id != pfYUV444PS) {
+        set_error("chroma=true requires YUV444PS");
+        return;
+    }
+
+    int device_id =
+        static_cast<int>(vsapi->propGetInt(in, "device_id", 0, &err));
+    if (err != 0) {
+        device_id = 0;
+    }
+
+    int extractor_exp =
+        static_cast<int>(vsapi->propGetInt(in, "extractor_exp", 0, &err));
+    if (err == 0) {
+        d->extractor =
+            (extractor_exp != 0) ? std::ldexp(1.0F, extractor_exp) : 0.0F;
+    } else {
+        d->extractor = 0.0F;
+    }
+
+    d->zero_init = (vsapi->propGetInt(in, "zero_init", 0, &err) != 0);
+    if (err != 0) {
+        d->zero_init = true;
+    }
+
+    @autoreleasepool {
+        NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
+        if (device_id >= static_cast<int>(devices.count)) {
+            set_error("invalid device_id");
+            return;
+        }
+        d->device = devices[device_id];
+        // NOLINTNEXTLINE(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
+        const char metal_source_chars[] = {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wc23-extensions"
+#embed "shader.metal"
+#pragma clang diagnostic pop
+        };
+        NSString* metalSource = [[NSString alloc]
+            initWithBytes:static_cast<const void*>(metal_source_chars)
+                   length:sizeof(metal_source_chars)
+                 encoding:NSUTF8StringEncoding];
+        NSError* error = nil;
+        id<MTLLibrary> library = [d->device newLibraryWithSource:metalSource
+                                                         options:nil
+                                                           error:&error];
+        if (library == nullptr) {
+            set_error("Failed to compile metal library: "s +
+                      [error.localizedDescription UTF8String]);
+            return;
+        }
+
+        bool fast = (vsapi->propGetInt(in, "fast", 0, &err) != 0);
+        if (err != 0) {
+            fast = false;
+        }
+        d->num_copy_engines = fast ? 4 : 1;
+        d->semaphore.current.store(d->num_copy_engines - 1,
+                                   std::memory_order::relaxed);
+        d->resources.reserve(d->num_copy_engines);
+
+        int max_width = d->process[0]
+                            ? d->vi->width
+                            : d->vi->width >> d->vi->format->subSamplingW;
+        int max_height = d->process[0]
+                             ? d->vi->height
+                             : d->vi->height >> d->vi->format->subSamplingH;
+        int num_planes = d->chroma ? 3 : 1;
+        int temporal_width = (2 * d->radius) + 1;
+
+        size_t min_pitch = max_width * sizeof(float);
+        d->d_pitch = ((min_pitch + 255) / 256) * 256;
+
+        size_t src_buffer_height =
+            (d->final_ ? 2 : 1) * num_planes * temporal_width * max_height;
+        size_t res_buffer_height = num_planes * temporal_width * 2 * max_height;
+
+        for (int i = 0; i < d->num_copy_engines; ++i) {
+            Metal_Resource res;
+            res.d_src =
+                [d->device newBufferWithLength:src_buffer_height * d->d_pitch
+                                       options:MTLResourceStorageModeShared];
+            res.d_res =
+                [d->device newBufferWithLength:res_buffer_height * d->d_pitch
+                                       options:MTLResourceStorageModeShared];
+            res.commandQueue = [d->device newCommandQueue];
+
+            res.params =
+                [d->device newBufferWithLength:sizeof(KernelParams)
+                                       options:MTLResourceStorageModeShared];
+
+            std::array<const char*, 8> kernel_names = {
+                "bm3d_false_false_false", "bm3d_false_false_true",
+                "bm3d_false_true_false",  "bm3d_false_true_true",
+                "bm3d_true_false_false",  "bm3d_true_false_true",
+                "bm3d_true_true_false",   "bm3d_true_true_true"};
+
+            for (int k = 0; k < 8; ++k) {
+                id<MTLFunction> func = [library
+                    newFunctionWithName:[NSString
+                                            stringWithUTF8String:kernel_names
+                                                                     .at(k)]];
+                if (func == nil) {
+                    set_error("Failed to get kernel function "s +
+                              kernel_names.at(k));
+                    return;
+                }
+                res.psos.at(k) =
+                    [d->device newComputePipelineStateWithFunction:func
+                                                             error:&error];
+                if (error != nil) {
+                    set_error("Failed to create PSO: "s +
+                              [error.localizedDescription UTF8String]);
+                    return;
+                }
+            }
+
+            id<MTLFunction> copy_func = [library
+                newFunctionWithName:[NSString
+                                        stringWithUTF8String:"copy_kernel"]];
+            if (copy_func == nil) {
+                set_error("Failed to get kernel function copy_kernel");
+                return;
+            }
+            res.copy_pso =
+                [d->device newComputePipelineStateWithFunction:copy_func
+                                                         error:&error];
+            if (error != nil) {
+                set_error("Failed to create PSO for copy_kernel: "s +
+                          [error.localizedDescription UTF8String]);
+                return;
+            }
+
+            d->resources.push_back(res);
+        }
+    }
+
+    vsapi->createFilter(in, out, "BM3D", BM3DInit, BM3DGetFrame, BM3DFree,
+                        fmParallel, 0, d.release(), core);
+}
+
+struct VAggregateData {
+    VSNodeRef* node;
+    VSNodeRef* src_node;
+    const VSVideoInfo* src_vi;
+    std::array<bool, 3> process;
+    int radius;
+    std::unordered_map<std::thread::id, std::vector<float>> buffer;
+    std::shared_mutex buffer_lock;
+};
+
+static void VS_CC VAggregateInit([[maybe_unused]] VSMap* in,
+                                 [[maybe_unused]] VSMap* out,
+                                 void** instanceData, VSNode* node,
+                                 [[maybe_unused]] VSCore* core,
+                                 const VSAPI* vsapi) {
+    auto* d = static_cast<VAggregateData*>(*instanceData);
+    vsapi->setVideoInfo(d->src_vi, 1, node);
+}
+
+static const VSFrameRef* VS_CC
+VAggregateGetFrame(int n, int activationReason, void** instanceData,
+                   [[maybe_unused]] void** frameData, VSFrameContext* frameCtx,
+                   VSCore* core, const VSAPI* vsapi) {
+    auto* d = static_cast<VAggregateData*>(*instanceData);
+
+    if (activationReason == arInitial) {
+        int start_frame = std::max(n - d->radius, 0);
+        int end_frame = std::min(n + d->radius, d->src_vi->numFrames - 1);
+        for (int i = start_frame; i <= end_frame; ++i) {
+            vsapi->requestFrameFilter(i, d->node, frameCtx);
+        }
+        vsapi->requestFrameFilter(n, d->src_node, frameCtx);
+    } else if (activationReason == arAllFramesReady) {
+        const VSFrameRef* src_frame =
+            vsapi->getFrameFilter(n, d->src_node, frameCtx);
+        std::vector<const VSFrameRef*> vbm3d_frames;
+        vbm3d_frames.reserve((2 * d->radius) + 1);
+        for (int i = n - d->radius; i <= n + d->radius; ++i) {
+            vbm3d_frames.emplace_back(vsapi->getFrameFilter(
+                std::clamp(i, 0, d->src_vi->numFrames - 1), d->node, frameCtx));
+        }
+
+        float* buffer{};
+        {
+            const auto thread_id = std::this_thread::get_id();
+            bool init = true;
+            {
+                std::shared_lock _{d->buffer_lock};
+                if (!d->buffer.contains(thread_id)) {
+                    init = false;
+                } else {
+                    buffer = d->buffer.at(thread_id).data();
+                }
+            }
+            if (!init) {
+                const int max_width = d->process[0]
+                                          ? vsapi->getFrameWidth(src_frame, 0)
+                                          : vsapi->getFrameWidth(src_frame, 1);
+                std::vector<float> owned_buffer(2 * max_width);
+                buffer = owned_buffer.data();
+                std::lock_guard _{d->buffer_lock};
+                d->buffer.emplace(thread_id, std::move(owned_buffer));
+            }
+        }
+
+        std::array<const VSFrameRef*, 3> fr = {
+            d->process[0] ? nullptr : src_frame,
+            d->process[1] ? nullptr : src_frame,
+            d->process[2] ? nullptr : src_frame};
+        std::array<int, 3> plane_indices = {0, 1, 2};
+        auto* dst_frame = vsapi->newVideoFrame2(
+            d->src_vi->format, d->src_vi->width, d->src_vi->height, fr.data(),
+            plane_indices.data(), src_frame, core);
+
+        for (int plane = 0; plane < d->src_vi->format->numPlanes; ++plane) {
+            if (d->process.at(plane)) {
+                int plane_width = vsapi->getFrameWidth(src_frame, plane);
+                int plane_height = vsapi->getFrameHeight(src_frame, plane);
+                int plane_stride = static_cast<int>(
+                    vsapi->getStride(src_frame, plane) / sizeof(float));
+
+                std::vector<const float*> srcps;
+                srcps.reserve((2 * d->radius) + 1);
+                for (int i = 0; i < (2 * d->radius) + 1; ++i) {
+                    srcps.emplace_back(reinterpret_cast<const float*>(
+                        vsapi->getReadPtr(vbm3d_frames[i], plane)));
+                }
+
+                auto* dstp = reinterpret_cast<float*>(
+                    vsapi->getWritePtr(dst_frame, plane));
+
+                float* sum_buffer = buffer;
+                float* weight_buffer = buffer + plane_width;
+
+                for (int y = 0; y < plane_height; ++y) {
+                    {
+                        const float* agg_src =
+                            srcps[0] +
+                            ((size_t)((std::clamp((2 * d->radius),
+                                                  n - d->src_vi->numFrames + 1 +
+                                                      d->radius,
+                                                  n + d->radius) *
+                                       2 * plane_height) +
+                                      y) *
+                             plane_stride);
+                        vDSP_mmov(agg_src, sum_buffer,
+                                  static_cast<vDSP_Length>(plane_width), 1, 1,
+                                  1);
+                        agg_src += (size_t)plane_height * plane_stride;
+                        vDSP_mmov(agg_src, weight_buffer,
+                                  static_cast<vDSP_Length>(plane_width), 1, 1,
+                                  1);
+                    }
+
+                    for (int i = 1; i < (2 * d->radius) + 1; ++i) {
+                        const float* agg_src =
+                            srcps[i] +
+                            ((size_t)((std::clamp((2 * d->radius) - i,
+                                                  n - d->src_vi->numFrames + 1 +
+                                                      d->radius,
+                                                  n + d->radius) *
+                                       2 * plane_height) +
+                                      y) *
+                             plane_stride);
+                        vDSP_vadd(sum_buffer, 1, agg_src, 1, sum_buffer, 1,
+                                  static_cast<vDSP_Length>(plane_width));
+                        agg_src += (size_t)plane_height * plane_stride;
+                        vDSP_vadd(weight_buffer, 1, agg_src, 1, weight_buffer,
+                                  1, static_cast<vDSP_Length>(plane_width));
+                    }
+
+                    for (int x = 0; x < plane_width; ++x) {
+                        dstp[x] =
+                            sum_buffer[x] /
+                            (weight_buffer[x] > 0 ? weight_buffer[x] : 1.F);
+                    }
+                    dstp += plane_stride;
+                }
+            }
+        }
+
+        for (const auto& frame : vbm3d_frames) {
+            vsapi->freeFrame(frame);
+        }
+        vsapi->freeFrame(src_frame);
+        return dst_frame;
+    }
+    return nullptr;
+}
+
+static void VS_CC VAggregateFree(void* instanceData,
+                                 [[maybe_unused]] VSCore* core,
+                                 const VSAPI* vsapi) noexcept {
+    auto d = std::unique_ptr<VAggregateData>(
+        static_cast<VAggregateData*>(instanceData));
+    vsapi->freeNode(d->src_node);
+    vsapi->freeNode(d->node);
+}
+
+static void VS_CC VAggregateCreate(const VSMap* in, VSMap* out,
+                                   [[maybe_unused]] void* userData,
+                                   VSCore* core, const VSAPI* vsapi) {
+    auto d = std::make_unique<VAggregateData>();
+    d->node = vsapi->propGetNode(in, "clip", 0, nullptr);
+    const auto* vi = vsapi->getVideoInfo(d->node);
+    d->src_node = vsapi->propGetNode(in, "src", 0, nullptr);
+    d->src_vi = vsapi->getVideoInfo(d->src_node);
+    d->radius = (vi->height / d->src_vi->height - 2) / 4;
+    d->process.fill(false);
+    for (int i = 0; i < vsapi->propNumElements(in, "planes"); ++i) {
+        int plane =
+            static_cast<int>(vsapi->propGetInt(in, "planes", i, nullptr));
+        if (plane >= 0 && plane < static_cast<int>(d->process.size())) {
+            d->process.at(plane) = true;
+        }
+    }
+    VSCoreInfo core_info;
+    vsapi->getCoreInfo2(core, &core_info);
+    d->buffer.reserve(core_info.numThreads);
+    vsapi->createFilter(in, out, "VAggregate", VAggregateInit,
+                        VAggregateGetFrame, VAggregateFree, fmParallel, 0,
+                        d.release(), core);
+}
+
+static void VS_CC BM3Dv2Create(const VSMap* in, VSMap* out,
+                               [[maybe_unused]] void* userData,
+                               [[maybe_unused]] VSCore* core,
+                               const VSAPI* vsapi) {
+    std::array<bool, 3> process;
+    process.fill(true);
+    int num_sigma_args = vsapi->propNumElements(in, "sigma");
+    for (int i = 0; i < std::min(3, num_sigma_args); ++i) {
+        if (vsapi->propGetFloat(in, "sigma", i, nullptr) <
+            std::numeric_limits<float>::epsilon()) {
+            process.at(i) = false;
+        }
+    }
+    if (num_sigma_args > 0) {
+        for (int i = num_sigma_args; i < 3; ++i) {
+            process.at(i) = process.at(i - 1);
+        }
+    }
+
+    bool skip = true;
+    auto* src = vsapi->propGetNode(in, "clip", 0, nullptr);
+    const auto* src_vi = vsapi->getVideoInfo(src);
+    for (int i = 0; i < src_vi->format->numPlanes; ++i) {
+        skip &= !process.at(i);
+    }
+    if (skip) {
+        vsapi->propSetNode(out, "clip", src, paReplace);
+        vsapi->freeNode(src);
+        return;
+    }
+
+    auto* map = vsapi->invoke(myself, "BM3D", in);
+    if (vsapi->getError(map) != nullptr) {
+        vsapi->setError(out, vsapi->getError(map));
+        vsapi->freeMap(map);
+        vsapi->freeNode(src);
+        return;
+    }
+
+    int err = 0;
+    int radius = static_cast<int>(vsapi->propGetInt(in, "radius", 0, &err));
+    if (err != 0) {
+        radius = 0;
+    }
+    if (radius == 0) {
+        auto* node = vsapi->propGetNode(map, "clip", 0, nullptr);
+        vsapi->freeMap(map);
+        vsapi->propSetNode(out, "clip", node, paReplace);
+        vsapi->freeNode(node);
+        vsapi->freeNode(src);
+        return;
+    }
+
+    vsapi->propSetNode(map, "src", src, paReplace);
+    vsapi->freeNode(src);
+    for (int i = 0; i < 3; ++i) {
+        if (process.at(i)) {
+            vsapi->propSetInt(map, "planes", i, paAppend);
+        }
+    }
+
+    auto* map2 = vsapi->invoke(myself, "VAggregate", map);
+    vsapi->freeMap(map);
+    if (vsapi->getError(map2) != nullptr) {
+        vsapi->setError(out, vsapi->getError(map2));
+        vsapi->freeMap(map2);
+        return;
+    }
+
+    auto* node = vsapi->propGetNode(map2, "clip", 0, nullptr);
+    vsapi->freeMap(map2);
+    vsapi->propSetNode(out, "clip", node, paReplace);
+    vsapi->freeNode(node);
+}
+
+VS_EXTERNAL_API(void)
+VapourSynthPluginInit(VSConfigPlugin configFunc,
+                      VSRegisterFunction registerFunc, VSPlugin* plugin) {
+    myself = plugin;
+    configFunc("com.Sunflower Dolls.bm3dmetal", "bm3dmetal",
+               "BM3D algorithm implemented in Metal", VAPOURSYNTH_API_VERSION,
+               1, plugin);
+    const char* bm3d_args = "clip:clip;ref:clip:opt;sigma:float[]:opt;block_"
+                            "step:int[]:opt;bm_range:"
+                            "int[]:opt;radius:int:opt;ps_num:int[]:opt;ps_"
+                            "range:int[]:opt;chroma:int:"
+                            "opt;device_id:int:opt;fast:int:opt;extractor_exp:"
+                            "int:opt;zero_init:int:"
+                            "opt;";
+    registerFunc("BM3D", bm3d_args, BM3DCreate, nullptr, plugin);
+    registerFunc("VAggregate", "clip:clip;src:clip;planes:int[];",
+                 VAggregateCreate, nullptr, plugin);
+    registerFunc("BM3Dv2", bm3d_args, BM3Dv2Create, nullptr, plugin);
+}

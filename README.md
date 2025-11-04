@@ -1,0 +1,184 @@
+# VapourSynth-BM3DMETAL
+
+Copyright© 2021 WolframRhodium
+
+Copyright© 2025 Sunflower Dolls
+
+BM3D denoising filter for VapourSynth, implemented in Metal.
+
+Ported from [VapourSynth-BM3DCUDA](https://github.com/WolframRhodium/VapourSynth-BM3DCUDA).
+
+## Description
+
+- Please check [VapourSynth-BM3D](https://github.com/HomeOfVapourSynthEvolution/VapourSynth-BM3D) for the original CPU implementation.
+
+- This Metal implementation leverages Apple's Metal API for GPU acceleration on macOS systems, providing efficient denoising on Apple Silicon and Intel Macs with Metal-capable GPUs.
+
+## Requirements
+
+- macOS 10.13 (High Sierra) or later.
+
+- Metal-capable GPU:
+  - Apple Silicon (M1, M2, M3, or newer)
+  - Intel Mac with Metal-capable GPU (requires SIMD width/thread execution width of 32; older Intel GPUs may not be supported)
+
+- VapourSynth installed on macOS.
+
+## Parameters
+
+```python3
+bm3dmetal.BM3D(clip clip[, clip ref=None, float[] sigma=3.0, int[] block_step=8, int[] bm_range=9, int radius=0, int[] ps_num=2, int[] ps_range=4, bint chroma=False, int device_id=0, bool fast=False])
+```
+
+- clip:
+
+    The input clip. Must be of 32 bit float format. Each plane is denoised separately if `chroma` is set to `False`. Data of unprocessed planes is undefined. Frame properties of the output clip are copied from it.
+
+- ref:
+
+    The reference clip. Must be of the same format, width, height, number of frames as `clip`.
+
+    Used in block-matching and as the reference in empirical Wiener filtering, i.e. `bm3d.Final` / `bm3d.VFinal`:
+
+    ```python3
+    basic = core.bm3dmetal.BM3D(src, radius=0)
+    final = core.bm3dmetal.BM3D(src, ref=basic, radius=0)
+
+    vbasic = core.bm3dmetal.BM3D(src, radius=radius_nonzero).bm3d.VAggregate(radius=radius_nonzero)
+    vfinal = core.bm3dmetal.BM3D(src, ref=vbasic, radius=r).bm3d.VAggregate(radius=r)
+    
+    # alternatively, using the v2 interface
+    basic_or_vbasic = core.bm3dmetal.BM3Dv2(src, radius=r)
+    final_or_vfinal = core.bm3dmetal.BM3Dv2(src, ref=basic_or_vbasic, radius=r)
+    ```
+
+    corresponds to the followings (ignoring color space handling and other differences in implementation), respectively
+
+    ```python3
+    basic = core.bm3d.Basic(clip)
+    final = core.bm3d.Final(basic, ref=basic)
+
+    vbasic = core.bm3d.VBasic(src, radius=r).bm3d.VAggregate(radius=r, sample=1)
+    vfinal = core.bm3d.VFinal(src, ref=vbasic, radius=r).bm3d.VAggregate(radius=r)
+    ```
+
+- sigma:
+    The strength of denoising for each plane.
+
+    The strength is similar (but not strictly equal) as `VapourSynth-BM3D` due to differences in implementation. (coefficient normalization is not implemented, for example)
+
+    Default `[3,3,3]`.
+
+- block_step, bm_range, radius, ps_num, ps_range:
+
+    Same as those in `VapourSynth-BM3D`.
+
+    If `chroma` is set to `True`, only the first value is in effect.
+
+    Otherwise an array of values may be specified for each plane (except `radius`).
+    
+    **Note**: It is generally not recommended to take a large value of `ps_num` as current implementations do not take duplicate block-matching candidates into account during temporary searching, which may leads to regression in denoising quality. This issue is not present in `VapourSynth-BM3D`.
+
+    **Note2**: Lowering the value of "block_step" will be useful in reducing blocking artifacts at the cost of slower processing.
+
+- chroma:
+
+    CBM3D algorithm. `clip` must be of `YUV444PS` format.
+
+    Y channel is used in block-matching of chroma channels.
+
+    Default `False`.
+
+- device_id:
+
+    Set Metal GPU device to be used (for systems with multiple GPUs).
+
+    Default `0`.
+
+- fast:
+
+    Enables multi-threaded copy between CPU and GPU, consuming 4x more memory.
+    
+    - **Apple Silicon**: Enabling this option will degrade performance. Keep it disabled.
+    - **Intel Mac with AMD discrete GPU**: May (or may not) provide slight performance improvement.
+
+    Default: `False`.
+
+- extractor_exp:
+
+    Used for deterministic (bitwise) output.
+
+    [Pre-rounding](https://ieeexplore.ieee.org/document/6545904) is employed for associative floating-point summation.
+
+    The value should be a positive integer not less than 3, and may need to be higher depending on the source video and filter parameters.
+
+    Default `0`. (non-determinism)
+
+- zero_init:
+
+    This parameter only has an effect in **temporal mode** (`radius > 0`).
+
+    It controls the output of planes that are **not** being processed (i.e., where `sigma` is set to 0).
+
+    - `True` (default): Unprocessed planes will be filled with zeros (resulting in a black image).
+    - `False`: Unprocessed planes will contain uninitialized data, which may appear as garbage or random noise.
+
+    This parameter has no effect in spatial mode (`radius = 0`), as unprocessed planes are copied from the source clip. It also has no effect on planes that are actively being denoised.
+
+    Default: `True`.
+
+## Notes
+
+- `bm3d.VAggregate` should be called after temporal filtering, as in `VapourSynth-BM3D`. Alternatively, you may use the `BM3Dv2()` interface for both spatial and temporal denoising in one step.
+
+- The Metal implementation uses Metal Shading Language for GPU kernels, providing efficient computation on Apple platforms.
+
+## Statistics
+
+GPU memory consumptions:
+
+`(ref ? 4 : 3) * (chroma ? 3 : 1) * (fast ? 4 : 1) * (2 * radius + 1) * size_of_a_single_frame`
+
+## Benchmarks
+
+Apple M2 Pro with 32GB RAM. MacOS 15.6.1
+
+input: 1920x1080
+
+- `chroma=False`: `GrayS`
+- `chroma=True`: `YUV444PS`
+
+data format: fps
+
+| radius | chroma | final | M2 pro |
+| ------ | ------ | ----- | ------ |
+| 0      | False  | False | 120.31 |
+| 0      | False  | True  | 102.20 |
+| 0      | True   | False | 56.09  |
+| 0      | True   | True  | 48.20  |
+| 1      | False  | False | 63.20  |
+| 1      | False  | True  | 57.61  |
+| 1      | True   | False | 29.03  |
+| 1      | True   | True  | 25.03  |
+| 2      | False  | False | 44.35  |
+| 2      | False  | True  | 39.69  |
+| 2      | True   | False | 20.34  |
+| 2      | True   | True  | 18.46  |
+
+## Compilation
+
+Requires CMake 3.15 or later and Xcode Command Line Tools.
+
+```bash
+cmake -S . -B build -D CMAKE_BUILD_TYPE=Release
+
+cmake --build build --config Release
+```
+
+The compiled dynamic library (`libbm3dmetal.dylib`) will be located in the `build/lib` directory. Copy it to your VapourSynth plugins directory.
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 or later (GPLv3+).
+
+Based on [VapourSynth-BM3DCUDA](https://github.com/WolframRhodium/VapourSynth-BM3DCUDA) by WolframRhodium, which is licensed under GPLv2 or later.
