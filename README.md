@@ -170,7 +170,7 @@ data format: fps
 Requires CMake 3.15 or later and Xcode Command Line Tools.
 
 ```bash
-cmake -S . -B build -D CMAKE_BUILD_TYPE=Release
+cmake -S . -B build -D CMAKE_BUILD_TYPE=Release -D VAPOURSYNTH_INCLUDE_DIRECTORY="/path/to/vapoursynth/include"
 
 cmake --build build --config Release
 ```

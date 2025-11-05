@@ -9,6 +9,8 @@ add_library(bm3dmetal SHARED
     bm3dmetal.mm
 )
 
+target_include_directories(bm3dmetal PRIVATE ${VAPOURSYNTH_INCLUDE_DIRECTORY})
+
 set_target_properties(bm3dmetal PROPERTIES 
     CXX_FLAGS "-Wno-c23-extensions -mmacosx-version-min=12.0"
     COMPILE_FLAGS "-fobjc-arc"

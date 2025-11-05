@@ -39,8 +39,8 @@
 #include <utility>
 #include <vector>
 
-#include "../include/VSHelper.h"
-#include "../include/VapourSynth.h"
+#include <VSHelper.h>
+#include <VapourSynth.h>
 
 using namespace std::string_literals;
 
