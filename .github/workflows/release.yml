@@ -20,9 +20,13 @@ jobs:
           # Ensure Xcode Command Line Tools are available
           xcode-select --print-path
       
+      - name: Setup VapourSynth headers
+        run: |
+          brew install vapoursynth
+
       - name: Configure CMake
         run: |
-          cmake -S . -B build -D CMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -D CMAKE_BUILD_TYPE=Release -D VAPOURSYNTH_INCLUDE_DIRECTORY="/opt/homebrew/include/vapoursynth/"
       
       - name: Build project
         run: |
