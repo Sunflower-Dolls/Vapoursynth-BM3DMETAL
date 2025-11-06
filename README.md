@@ -141,8 +141,6 @@ GPU memory consumptions:
 
 ## Benchmarks
 
-Apple M2 Pro with 32GB RAM. MacOS 15.6.1
-
 input: 1920x1080
 
 - `chroma=False`: `GrayS`
@@ -150,20 +148,20 @@ input: 1920x1080
 
 data format: fps
 
-| radius | chroma | final | M2 pro |
-| ------ | ------ | ----- | ------ |
-| 0      | False  | False | 120.31 |
-| 0      | False  | True  | 102.20 |
-| 0      | True   | False | 56.09  |
-| 0      | True   | True  | 48.20  |
-| 1      | False  | False | 63.20  |
-| 1      | False  | True  | 57.61  |
-| 1      | True   | False | 29.03  |
-| 1      | True   | True  | 25.03  |
-| 2      | False  | False | 44.35  |
-| 2      | False  | True  | 39.69  |
-| 2      | True   | False | 20.34  |
-| 2      | True   | True  | 18.46  |
+| radius | chroma | final | M2 Pro 32GB (macOS 15.6.1) | M4 16GB (macOS 26.1) |
+| ------ | ------ | ----- | -------------------------- | -------------------- |
+| 0      | False  | False | 120.31                     | 173.74               |
+| 0      | False  | True  | 102.20                     | 102.86               |
+| 0      | True   | False | 56.09                      | 71.08                |
+| 0      | True   | True  | 48.20                      | 49.18                |
+| 1      | False  | False | 63.20                      | 71.56                |
+| 1      | False  | True  | 57.61                      | 51.07                |
+| 1      | True   | False | 29.03                      | 24.93                |
+| 1      | True   | True  | 25.03                      | 25.39                |
+| 2      | False  | False | 44.35                      | 58.43                |
+| 2      | False  | True  | 39.69                      | 53.94                |
+| 2      | True   | False | 20.34                      | 16.46                |
+| 2      | True   | True  | 18.46                      | 11.99                |
 
 ## Compilation
 

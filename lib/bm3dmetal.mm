@@ -153,8 +153,9 @@ struct Metal_Resource {
 
     Metal_Resource(Metal_Resource&& other) noexcept
         : d_src(std::move(other.d_src)), d_res(std::move(other.d_res)),
-          commandQueue(std::move(other.commandQueue)), psos(std::move(other.psos)),
-          copy_pso(std::move(other.copy_pso)), params(std::move(other.params)) {
+          commandQueue(std::move(other.commandQueue)),
+          psos(std::move(other.psos)), copy_pso(std::move(other.copy_pso)),
+          params(std::move(other.params)) {
         other.d_src = nil;
         other.d_res = nil;
         other.commandQueue = nil;
@@ -436,18 +437,16 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                 auto* h_dst = static_cast<float*>(resource.d_res.contents);
                 for (int plane = 0; plane < 3; ++plane) {
                     if (!d->process.at(plane)) {
-                        h_dst +=
-                            (size_t)d_stride * height * 2 * temporal_width;
+                        h_dst += (size_t)d_stride * height * 2 * temporal_width;
                         continue;
                     }
                     const int s_pitch = vsapi->getStride(src, plane);
 
                     if (radius != 0) {
-                        int out_height = vsapi->getFrameHeight(src, plane) *
-                                         2 * temporal_width;
+                        int out_height = vsapi->getFrameHeight(src, plane) * 2 *
+                                         temporal_width;
                         int width_bytes = static_cast<int>(
-                            vsapi->getFrameWidth(src, plane) *
-                            sizeof(float));
+                            vsapi->getFrameWidth(src, plane) * sizeof(float));
 
                         id<MTLCommandBuffer> outCmdBuf =
                             [resource.commandQueue commandBuffer];
@@ -455,25 +454,23 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                             [outCmdBuf computeCommandEncoder];
                         [outEnc setComputePipelineState:resource.copy_pso];
 
-                        encode_copy_to_vs(
-                            outEnc, d->device, resource.d_res,
-                            reinterpret_cast<uint8_t*>(h_dst) -
-                                reinterpret_cast<uint8_t*>(
-                                    resource.d_res.contents),
-                            d->d_pitch,
-                            vsapi->getWritePtr(dst.get(), plane),
-                            (size_t)out_height * s_pitch, s_pitch,
-                            width_bytes, out_height);
+                        encode_copy_to_vs(outEnc, d->device, resource.d_res,
+                                          reinterpret_cast<uint8_t*>(h_dst) -
+                                              reinterpret_cast<uint8_t*>(
+                                                  resource.d_res.contents),
+                                          d->d_pitch,
+                                          vsapi->getWritePtr(dst.get(), plane),
+                                          (size_t)out_height * s_pitch, s_pitch,
+                                          width_bytes, out_height);
 
                         [outEnc endEncoding];
                         [outCmdBuf commit];
                         [outCmdBuf waitUntilCompleted];
                     } else {
-                        Aggregation(
-                            reinterpret_cast<float*>(
-                                vsapi->getWritePtr(dst.get(), plane)),
-                            static_cast<int>(s_pitch / sizeof(float)),
-                            h_dst, d_stride, width, height);
+                        Aggregation(reinterpret_cast<float*>(
+                                        vsapi->getWritePtr(dst.get(), plane)),
+                                    static_cast<int>(s_pitch / sizeof(float)),
+                                    h_dst, d_stride, width, height);
                     }
                     h_dst += (size_t)d_stride * height * 2 * temporal_width;
                 }
@@ -486,10 +483,8 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                     int width = vsapi->getFrameWidth(src, plane);
                     int height = vsapi->getFrameHeight(src, plane);
                     int s_pitch = vsapi->getStride(src, plane);
-                    int d_stride =
-                        static_cast<int>(d->d_pitch / sizeof(float));
-                    int width_bytes =
-                        static_cast<int>(width * sizeof(float));
+                    int d_stride = static_cast<int>(d->d_pitch / sizeof(float));
+                    int width_bytes = static_cast<int>(width * sizeof(float));
 
                     size_t res_size =
                         (size_t)temporal_width * 2 * height * d->d_pitch;
@@ -518,25 +513,22 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                     size_t d_src_offset = 0;
                     for (int i = 0; i < num_input_frames; ++i) {
                         const VSFrameRef* frame = srcs[i].get();
-                        encode_copy_from_vs(encoder, d->device,
-                                            vsapi->getReadPtr(frame, plane),
-                                            (size_t)height * s_pitch,
-                                            s_pitch, resource.d_src,
-                                            d_src_offset, d->d_pitch,
-                                            width_bytes, height);
+                        encode_copy_from_vs(
+                            encoder, d->device, vsapi->getReadPtr(frame, plane),
+                            (size_t)height * s_pitch, s_pitch, resource.d_src,
+                            d_src_offset, d->d_pitch, width_bytes, height);
                         d_src_offset += d->d_pitch * height;
                     }
 
                     int pso_idx = (static_cast<int>(d->radius > 0) * 4) +
                                   (0 * 2) + static_cast<int>(d->final_);
-                    [encoder
-                        setComputePipelineState:resource.psos.at(pso_idx)];
+                    [encoder setComputePipelineState:resource.psos.at(pso_idx)];
 
                     [encoder setBuffer:resource.d_res offset:0 atIndex:0];
                     [encoder setBuffer:resource.d_src offset:0 atIndex:1];
 
-                    auto* params = static_cast<KernelParams*>(
-                        [resource.params contents]);
+                    auto* params =
+                        static_cast<KernelParams*>([resource.params contents]);
                     params->width = width;
                     params->height = height;
                     params->stride = d_stride;
@@ -551,9 +543,9 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                     params->extractor = d->extractor;
 
                     [encoder setBuffer:resource.params offset:0 atIndex:2];
-                    [encoder setThreadgroupMemoryLength:sizeof(float) * 8 *
-                                                        (32 + 1)
-                                                atIndex:0];
+                    [encoder
+                        setThreadgroupMemoryLength:sizeof(float) * 8 * (32 + 1)
+                                           atIndex:0];
 
                     MTLSize gridDim = MTLSizeMake(
                         (width + (4 * d->block_step.at(plane) - 1)) /
@@ -568,17 +560,15 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                     [commandBuffer commit];
                     [commandBuffer waitUntilCompleted];
 
-                    auto* h_dst =
-                        static_cast<float*>(resource.d_res.contents);
+                    auto* h_dst = static_cast<float*>(resource.d_res.contents);
                     auto* dstp = reinterpret_cast<float*>(
                         vsapi->getWritePtr(dst.get(), plane));
                     if (radius != 0) {
                         int s_pitch = vsapi->getStride(src, plane);
-                        int out_height = vsapi->getFrameHeight(src, plane) *
-                                         2 * temporal_width;
+                        int out_height = vsapi->getFrameHeight(src, plane) * 2 *
+                                         temporal_width;
                         int width_bytes = static_cast<int>(
-                            vsapi->getFrameWidth(src, plane) *
-                            sizeof(float));
+                            vsapi->getFrameWidth(src, plane) * sizeof(float));
 
                         id<MTLCommandBuffer> outCmdBuf =
                             [resource.commandQueue commandBuffer];
@@ -586,23 +576,22 @@ static const VSFrameRef* VS_CC BM3DGetFrame(int n, int activationReason,
                             [outCmdBuf computeCommandEncoder];
                         [outEnc setComputePipelineState:resource.copy_pso];
 
-                        encode_copy_to_vs(
-                            outEnc, d->device, resource.d_res,
-                            reinterpret_cast<uint8_t*>(h_dst) -
-                                reinterpret_cast<uint8_t*>(
-                                    resource.d_res.contents),
-                            d->d_pitch,
-                            vsapi->getWritePtr(dst.get(), plane),
-                            (size_t)out_height * s_pitch, s_pitch,
-                            width_bytes, out_height);
+                        encode_copy_to_vs(outEnc, d->device, resource.d_res,
+                                          reinterpret_cast<uint8_t*>(h_dst) -
+                                              reinterpret_cast<uint8_t*>(
+                                                  resource.d_res.contents),
+                                          d->d_pitch,
+                                          vsapi->getWritePtr(dst.get(), plane),
+                                          (size_t)out_height * s_pitch, s_pitch,
+                                          width_bytes, out_height);
 
                         [outEnc endEncoding];
                         [outCmdBuf commit];
                         [outCmdBuf waitUntilCompleted];
                     } else {
-                        Aggregation(
-                            dstp, static_cast<int>(s_pitch / sizeof(float)),
-                            h_dst, d_stride, width, height);
+                        Aggregation(dstp,
+                                    static_cast<int>(s_pitch / sizeof(float)),
+                                    h_dst, d_stride, width, height);
                     }
                 }
             }
