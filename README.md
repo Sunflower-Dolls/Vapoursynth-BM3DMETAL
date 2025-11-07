@@ -139,6 +139,10 @@ GPU memory consumptions:
 
 `(ref ? 4 : 3) * (chroma ? 3 : 1) * (fast ? 4 : 1) * (2 * radius + 1) * size_of_a_single_frame`
 
+Compute complexity:
+
+`(chroma ? 3 : 1) * ceil((width - 8) / block_step + 1) * ceil((height - 8) / block_step + 1) * ((2 * bm_range + 1) * (2 * bm_range + 1) + 2 * radius * ps_num * (2 * ps_range + 1) * (2 * ps_range + 1)) * (final ? 1.5 : 1) + (radius > 0 ? width * height * (chroma ? 3 : 1) * 2 * radius : 0)`
+
 ## Benchmarks
 
 input: 1920x1080
