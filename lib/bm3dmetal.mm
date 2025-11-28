@@ -1177,7 +1177,7 @@ VS_EXTERNAL_API(void)
 VapourSynthPluginInit(VSConfigPlugin configFunc,
                       VSRegisterFunction registerFunc, VSPlugin* plugin) {
     myself = plugin;
-    configFunc("com.Sunflower Dolls.bm3dmetal", "bm3dmetal",
+    configFunc("com.Sunflower-Dolls.bm3dmetal", "bm3dmetal",
                "BM3D algorithm implemented in Metal", VAPOURSYNTH_API_VERSION,
                1, plugin);
     const char* bm3d_args = "clip:clip;ref:clip:opt;sigma:float[]:opt;block_"
